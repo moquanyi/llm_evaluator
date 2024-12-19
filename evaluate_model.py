@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -36,21 +36,26 @@ class ModelEvaluator:
         )
         return response.choices[0].message.content
 
-    def _calculate_weighted_score(self, scores: Dict[str, float], weights: Dict[str, float]) -> float:
-        """Calculate weighted average score, ignoring NA values."""
-        total_score = 0.0
-        total_weight = 0.0
+    def _calculate_weighted_score(self, scores: Dict[str, Any], weights: Dict[str, float]) -> float:
+        """Calculate weighted average score, handling NA values."""
+        valid_scores = 0
+        weighted_sum = 0
+        total_weight = 0
         
-        for aspect, score in scores.items():
-            # Skip if score is NA or aspect not in weights
-            if score == "NA" or aspect not in weights:
+        for criterion, score in scores.items():
+            if criterion == 'overall_score':
                 continue
-            weight = weights[aspect]
-            total_score += score * weight
-            total_weight += weight
+                
+            weight = weights.get(criterion, 1.0)
+            if score != "NA" and isinstance(score, (int, float)):
+                weighted_sum += float(score) * weight
+                total_weight += weight
+                valid_scores += 1
         
-        # Return weighted average if we have valid scores, otherwise NA
-        return total_score / total_weight if total_weight > 0 else "NA"
+        if valid_scores == 0 or total_weight == 0:
+            return 0
+            
+        return weighted_sum / total_weight
 
     def _evaluate_response(
         self,
@@ -72,58 +77,58 @@ class ModelEvaluator:
         ])
         
         evaluation_prompt = f"""
-Evaluate this response:
+Evaluate this response based on the given criteria. For each criterion:
+1. Provide a detailed evaluation explaining your reasoning
+2. Give a score from 0 to 1 (or "NA" if not applicable)
+
+Response to evaluate:
 Prompt: {prompt}
 Reference Answer: {reference_answer}
 Model Response: {model_response}
 
-Evaluate based on these criteria:
+Evaluation Criteria:
 {criteria_text}
 
-Provide a detailed evaluation explaining your reasoning.
-"""
+Format your response as follows:
+[Criterion Name]
+Evaluation: [Your detailed evaluation]
+Score: [0-1 or NA]
 
-        score_prompt = f"""
-Based on your evaluation, provide scores from 0-1 (or "NA" if not applicable) for each criterion.
-Return your response in this exact JSON format:
+After evaluating all criteria, provide a JSON object containing just the scores in this format:
 {{
     "criterion1": score1,
     "criterion2": score2,
     ...
 }}
-Use only numbers (0-1) or "NA" as values. Do not include any explanation text in this response.
-
-Criteria to score:
-{str({k: v['description'] for k, v in domain_criteria.items()})}
 """
 
         try:
-            # Get detailed evaluation
-            evaluation_response = self.client.chat.completions.create(
+            # Get evaluation and scores in a single call
+            response = self.client.chat.completions.create(
                 model=self.test_model,
                 messages=[
-                    {"role": "system", "content": "You are an expert evaluator. Provide detailed evaluation of the response."},
+                    {"role": "system", "content": "You are an expert evaluator. Provide a detailed evaluation with numerical scores for each criterion."},
                     {"role": "user", "content": evaluation_prompt}
                 ],
                 temperature=0
             )
-            evaluation_text = evaluation_response.choices[0].message.content
-
-            # Get numerical scores
-            score_response = self.client.chat.completions.create(
-                model=self.test_model,
-                messages=[
-                    {"role": "system", "content": "You are an expert evaluator. Provide numerical scores based on the criteria."},
-                    {"role": "user", "content": score_prompt}
-                ],
-                temperature=0
-            )
             
+            full_response = response.choices[0].message.content
+            
+            # Extract the JSON scores from the end of the response
             try:
-                scores = json.loads(score_response.choices[0].message.content)
-            except json.JSONDecodeError:
-                print(f"Error parsing score response: {score_response.choices[0].message.content}")
+                # Find the last occurrence of a JSON-like structure
+                json_start = full_response.rindex("{")
+                json_end = full_response.rindex("}") + 1
+                scores_text = full_response[json_start:json_end]
+                scores = json.loads(scores_text)
+                
+                # Remove the JSON part from the evaluation text
+                evaluation_text = full_response[:json_start].strip()
+            except (ValueError, json.JSONDecodeError) as e:
+                print(f"Error parsing scores from response: {e}")
                 scores = {k: "NA" for k in domain_criteria.keys()}
+                evaluation_text = full_response
             
             # Calculate weighted average explicitly
             overall_score = self._calculate_weighted_score(scores, weights)
@@ -144,112 +149,122 @@ Criteria to score:
     def evaluate(self) -> Dict[str, Any]:
         """Evaluate the test model on the entire dataset."""
         start_time = time.time()
-        
         results = {
             "metadata": {
                 "test_model": self.test_model,
                 "evaluation_time": datetime.now().isoformat(),
-                "dataset_info": self.dataset["metadata"],
-                "timing_info": {
-                    "total_time": 0,
-                    "by_domain": {}
-                }
+                "dataset_info": self.dataset.get("metadata", {})
             },
-            "evaluations": []
+            "evaluations": [],
+            "aggregate_scores": {},
+            "timing_info": {
+                "total_time": 0,
+                "by_domain": {}
+            }
         }
-
-        for item in tqdm(self.dataset["data"], desc="Evaluating responses"):
+        
+        # Group samples by domain
+        domain_samples = {}
+        for item in self.dataset.get("data", []):  
             domain = item["domain"]
+            if domain not in domain_samples:
+                domain_samples[domain] = []
+            domain_samples[domain].append(item)
+        
+        # Process each domain
+        for domain, samples in domain_samples.items():
+            domain_start_time = time.time()
+            domain_timing = {
+                "total": 0,
+                "samples": [],
+                "avg_response_time": 0,
+                "avg_evaluation_time": 0
+            }
             
-            # Initialize domain timing if not exists
-            if domain not in results["metadata"]["timing_info"]["by_domain"]:
-                results["metadata"]["timing_info"]["by_domain"][domain] = {
-                    "total": 0,
-                    "samples": []
+            # Process samples within the domain
+            for item in tqdm(samples, desc=f"Evaluating {domain} responses"):
+                sample_start_time = time.time()
+                
+                # Generate model response
+                response_start_time = time.time()
+                model_response = self._generate_model_response(item["prompt"])
+                response_time = time.time() - response_start_time
+                
+                # Evaluate response
+                eval_start_time = time.time()
+                evaluation = self._evaluate_response(
+                    item["prompt"],
+                    item["reference_answer"],
+                    model_response,
+                    item["domain"]
+                )
+                eval_time = time.time() - eval_start_time
+                
+                # Record timing for this sample
+                sample_timing = {
+                    "response_generation": response_time,
+                    "evaluation": eval_time,
+                    "total": time.time() - sample_start_time
                 }
+                domain_timing["samples"].append(sample_timing)
+                
+                # Store evaluation results
+                results["evaluations"].append({
+                    "domain": item["domain"],
+                    "prompt": item["prompt"],
+                    "reference_answer": item["reference_answer"],
+                    "model_response": model_response,
+                    "evaluation": evaluation,
+                    "timing": sample_timing
+                })
             
-            sample_timing = {}
+            # Calculate domain timing averages
+            domain_timing["total"] = time.time() - domain_start_time
+            if domain_timing["samples"]:
+                domain_timing["avg_response_time"] = sum(s["response_generation"] for s in domain_timing["samples"]) / len(domain_timing["samples"])
+                domain_timing["avg_evaluation_time"] = sum(s["evaluation"] for s in domain_timing["samples"]) / len(domain_timing["samples"])
             
-            # Time model response generation
-            response_start = time.time()
-            model_response = self._generate_model_response(item["prompt"])
-            response_end = time.time()
-            sample_timing["response_generation"] = response_end - response_start
-            
-            # Time evaluation process
-            eval_start = time.time()
-            evaluation = self._evaluate_response(
-                item["prompt"],
-                item["reference_answer"],
-                model_response,
-                item["domain"]
-            )
-            eval_end = time.time()
-            sample_timing["evaluation"] = eval_end - eval_start
-            
-            # Calculate total sample time
-            sample_timing["total"] = eval_end - response_start
-            
-            # Add timing to domain stats
-            results["metadata"]["timing_info"]["by_domain"][domain]["samples"].append(sample_timing)
-            
-            results["evaluations"].append({
-                "domain": item["domain"],
-                "prompt": item["prompt"],
-                "reference_answer": item["reference_answer"],
-                "model_response": model_response,
-                "evaluation": evaluation,
-                "timing": sample_timing
-            })
-
-        # Calculate domain totals
-        for domain, timing in results["metadata"]["timing_info"]["by_domain"].items():
-            timing["total"] = sum(s["total"] for s in timing["samples"])
-            timing["avg_response_time"] = sum(s["response_generation"] for s in timing["samples"]) / len(timing["samples"])
-            timing["avg_evaluation_time"] = sum(s["evaluation"] for s in timing["samples"]) / len(timing["samples"])
-
+            results["timing_info"]["by_domain"][domain] = domain_timing
+        
         # Calculate aggregate scores by domain
-        results["aggregate_scores"] = {}
-        for domain in set(eval["domain"] for eval in results["evaluations"]):
-            domain_scores = [eval["evaluation"]["scores"] for eval in results["evaluations"] 
-                           if eval["domain"] == domain]
-            
-            # Get all unique score types in this domain
+        domain_scores = {}
+        for eval_result in results["evaluations"]:
+            domain = eval_result["domain"]
+            if domain not in domain_scores:
+                domain_scores[domain] = []
+            domain_scores[domain].append(eval_result["evaluation"]["scores"])
+        
+        # Calculate average scores for each domain
+        for domain, scores_list in domain_scores.items():
+            results["aggregate_scores"][domain] = {}
+            # Get all score types (excluding overall_score which we'll calculate)
             score_types = set()
-            for scores in domain_scores:
-                score_types.update(scores.keys())
+            for scores in scores_list:
+                score_types.update(k for k in scores.keys() if k != "overall_score")
             
             # Calculate average for each score type
-            results["aggregate_scores"][domain] = {
-                score_type: sum(s.get(score_type, 0) for s in domain_scores) / len(domain_scores)
-                for score_type in score_types
-            }
-        
-        # Calculate and add total time
-        total_time = time.time() - start_time
-        results["metadata"]["timing_info"]["total_time"] = total_time
-
-        # Save results
-        output_path = f"results/evaluation_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        os.makedirs("results", exist_ok=True)
-        with open(output_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            for score_type in score_types:
+                valid_scores = [
+                    float(s[score_type]) 
+                    for s in scores_list 
+                    if score_type in s and s[score_type] != "NA" and isinstance(s[score_type], (int, float))
+                ]
+                if valid_scores:
+                    results["aggregate_scores"][domain][score_type] = sum(valid_scores) / len(valid_scores)
+                else:
+                    results["aggregate_scores"][domain][score_type] = 0
             
-        # Create/update symbolic link to latest results
-        latest_link = "results/evaluation_results_latest.json"
-        if os.path.exists(latest_link):
-            os.remove(latest_link)
-        os.symlink(os.path.basename(output_path), latest_link)
+            # Calculate overall score for domain
+            weights = self.dataset["evaluation_criteria"][domain]
+            domain_weights = {k: v["weight"] for k, v in weights.items()}
+            results["aggregate_scores"][domain]["overall_score"] = self._calculate_weighted_score(
+                results["aggregate_scores"][domain],
+                domain_weights
+            )
         
-        # Print timing summary
-        print("\nTiming Summary:")
-        print(f"Total evaluation time: {total_time:.2f}s")
-        for domain, timing in results["metadata"]["timing_info"]["by_domain"].items():
-            print(f"\n{domain.capitalize()} Domain:")
-            print(f"  Total time: {timing['total']:.2f}s")
-            print(f"  Average response generation: {timing['avg_response_time']:.2f}s")
-            print(f"  Average evaluation time: {timing['avg_evaluation_time']:.2f}s")
-
+        # Record total evaluation time
+        results["timing_info"]["total_time"] = time.time() - start_time
+        
         return results
 
     def format_results(self, results: Dict[str, Any], format_type: str = None) -> str:
@@ -265,31 +280,83 @@ Evaluation Results
 Test Model: {results['metadata']['test_model']}
 Evaluation Time: {results['metadata']['evaluation_time']}
 
-Aggregate Scores by Domain
--------------------------
-"""
-        for domain, scores in results["aggregate_scores"].items():
-            text_output += f"\n{domain.capitalize()} Domain:\n"
-            for metric, score in scores.items():
-                text_output += f"  {metric}: {score:.2f}\n"
+Timing Summary
+-------------
+Total evaluation time: {results['timing_info']['total_time']:.2f}s
 
-        text_output += f"""
+"""
+        # Add domain timing summaries
+        for domain, timing in results['timing_info']['by_domain'].items():
+            text_output += f"{domain.capitalize()} Domain:\n"
+            text_output += f"  Total time: {timing['total']:.2f}s\n"
+            if timing.get('samples'):
+                text_output += f"  Average response generation: {timing['avg_response_time']:.2f}s\n"
+                text_output += f"  Average evaluation time: {timing['avg_evaluation_time']:.2f}s\n"
+            text_output += "\n"
+            
+        if results["aggregate_scores"]:
+            text_output += "Aggregate Scores by Domain\n"
+            text_output += "-------------------------\n"
+            for domain, scores in results["aggregate_scores"].items():
+                text_output += f"\n{domain.capitalize()} Domain:\n"
+                for metric, score in scores.items():
+                    text_output += f"  {metric}: {score:.2f}\n"
+        
+        if results["evaluations"]:
+            text_output += f"""
 Detailed Evaluations
 -------------------
 """
-        for eval in results["evaluations"]:
-            text_output += f"\nDomain: {eval['domain']}\n"
-            text_output += f"Prompt: {eval['prompt']}\n"
-            text_output += f"Evaluation:\n{eval['evaluation']['text_evaluation']}\n"
-            text_output += f"Scores:\n"
-            for metric, score in eval['evaluation']['scores'].items():
-                text_output += f"  {metric}: {score}\n"
-            text_output += "-" * 80 + "\n"
+            for eval in results["evaluations"]:
+                text_output += f"\nDomain: {eval['domain']}\n"
+                text_output += f"Prompt: {eval['prompt']}\n"
+                text_output += f"Model Response: {eval['model_response']}\n"
+                text_output += f"Evaluation:\n{eval['evaluation']['text_evaluation']}\n"
+                text_output += f"Scores:\n"
+                for metric, score in eval['evaluation']['scores'].items():
+                    text_output += f"  {metric}: {score}\n"
+                text_output += "-" * 80 + "\n"
         
         if format_type == "text":
             return text_output
         else:
             return text_output, results
+
+    def save_results_to_json(self, results, output_path=None):
+        """
+        Save evaluation results to a JSON file and create a symbolic link to the latest results.
+        
+        Args:
+            results (dict): Evaluation results dictionary
+            output_path (str, optional): Path to save the results. If None, will generate a timestamped path.
+        
+        Returns:
+            str: Path where the results were saved
+        """
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join("results", f"evaluation_results_{timestamp}.json")
+        
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Convert any non-serializable objects to strings
+        def serialize_datetime(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            return str(obj)
+        
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2, default=serialize_datetime)
+        
+        print(f"Results saved to {output_path}")
+        # Create or update symbolic link to latest results
+        latest_link = os.path.join("results", "evaluation_results_latest.json")
+        if os.path.exists(latest_link):
+            os.remove(latest_link)
+        os.symlink(os.path.basename(output_path), latest_link)
+        
+        return output_path
 
 if __name__ == "__main__":
     # Example usage
@@ -300,3 +367,4 @@ if __name__ == "__main__":
     )
     results = evaluator.evaluate()
     formatted_results = evaluator.format_results(results)
+    evaluator.save_results_to_json(formatted_results)

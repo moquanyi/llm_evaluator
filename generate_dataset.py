@@ -17,7 +17,7 @@ class DatasetGenerator:
         domains: List[str],
         gold_standard_model: str = "gpt-4-turbo",
         samples_per_domain: int = 100,
-        config_path: str = "config/evaluation_criteria.yaml"
+        config_path: str = "config/evaluation.yaml"
     ):
         self.domains = domains
         self.gold_standard_model = gold_standard_model
@@ -152,66 +152,19 @@ class DatasetGenerator:
 
     def _get_default_variables(self, domain: str) -> Dict[str, str]:
         """Get default variables for a domain."""
-        if domain == "general":
-            return {
-                "topic": random.choice([
-                    "artificial intelligence", "climate change", "quantum computing",
-                    "renewable energy", "blockchain technology", "machine learning"
-                ]),
-                "topic_1": random.choice([
-                    "traditional education", "remote work", "social media"
-                ]),
-                "topic_2": random.choice([
-                    "online learning", "office work", "in-person networking"
-                ])
-            }
-        elif domain == "coding":
-            return {
-                "data_structure": random.choice([
-                    "binary tree", "hash table", "linked list", "stack", "queue"
-                ]),
-                "functionality": random.choice([
-                    "insertion", "deletion", "search", "traversal", "sorting"
-                ]),
-                "optimization_criteria": random.choice([
-                    "time complexity", "space efficiency", "readability"
-                ]),
-                "problem": random.choice([
-                    "find the longest common subsequence",
-                    "implement a cache with LRU policy",
-                    "detect a cycle in a linked list"
-                ]),
-                "code": "def example(n):\n    return n * 2  # Placeholder code"
-            }
-        elif domain == "math":
-            return {
-                "theorem": random.choice([
-                    "the Pythagorean theorem",
-                    "the fundamental theorem of calculus",
-                    "the binomial theorem"
-                ]),
-                "conditions": random.choice([
-                    "positive integers", "real numbers", "prime numbers"
-                ]),
-                "topic": random.choice([
-                    "linear algebra", "calculus", "probability"
-                ]),
-                "concept_1": random.choice([
-                    "derivatives", "matrices", "vectors"
-                ]),
-                "concept_2": random.choice([
-                    "integrals", "eigenvalues", "cross products"
-                ]),
-                "equation_type": random.choice([
-                    "quadratic", "differential", "linear"
-                ]),
-                "equation": random.choice([
-                    "x^2 + 5x + 6 = 0",
-                    "dy/dx + 2y = x",
-                    "3x + 4y = 10"
-                ])
-            }
-        return {}
+        config_path = os.path.join("config", "evaluation.yaml")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        default_vars = config.get('default_variables', {})
+        if domain not in default_vars:
+            return {}
+        
+        domain_vars = default_vars[domain]
+        return {
+            key: random.choice(value) if isinstance(value, list) else value
+            for key, value in domain_vars.items()
+        }
 
     def _generate_prompt(self, domain: str) -> tuple:
         """Generate a prompt for the specified domain."""
@@ -280,7 +233,7 @@ Ensure your response is:
                     "by_domain": {}
                 }
             },
-            "evaluation_criteria": self.config["evaluation_criteria"],
+            "evaluation_criteria": self.config["evaluation"],
             "data": []
         }
 
