@@ -27,128 +27,11 @@ class DatasetGenerator:
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load evaluation criteria configuration."""
-        default_config = {
-            "evaluation_criteria": {
-                "accuracy": "Measure of factual correctness",
-                "coherence": "Logical flow and consistency",
-                "relevance": "Appropriateness to the prompt",
-                "completeness": "Coverage of all aspects",
-            },
-            "prompt_templates": {
-                "general": {
-                    "templates": [
-                        "Generate a question about {topic}",
-                        "Compare and contrast {topic_1} and {topic_2}",
-                        "Explain the concept of {topic} in simple terms"
-                    ],
-                    "use_model_variables": False,
-                    "variable_prompts": {}
-                },
-                "coding": {
-                    "templates": [
-                        "Create a programming challenge about {data_structure} and {functionality}",
-                        "Optimize the following {code} for {optimization_criteria}",
-                        "Solve the problem of {problem} using {data_structure}"
-                    ],
-                    "use_model_variables": False,
-                    "variable_prompts": {}
-                },
-                "math": {
-                    "templates": [
-                        "Prove the {theorem} for {conditions}",
-                        "Solve the {equation_type} equation: {equation}",
-                        "Explain the concept of {concept_1} and {concept_2} in {topic}"
-                    ],
-                    "use_model_variables": False,
-                    "variable_prompts": {}
-                }
-            },
-            "evaluation_instructions": {
-                "general": [
-                    "Provide a clear and concise answer",
-                    "Use simple language and avoid jargon",
-                    "Include relevant examples or anecdotes"
-                ],
-                "coding": [
-                    "Write clean and readable code",
-                    "Use proper indentation and formatting",
-                    "Include comments to explain your thought process"
-                ],
-                "math": [
-                    "Use mathematical notation and symbols correctly",
-                    "Provide step-by-step solutions to equations",
-                    "Explain the underlying concepts and theories"
-                ]
-            }
-        }
-        
         try:
             with open(config_path, 'r') as f:
                 return yaml.safe_load(f)
         except FileNotFoundError:
-            return default_config
-
-    def _validate_response(self, response: str, prompt: str) -> str:
-        """Validate and format the model's response according to prompt constraints."""
-        response = response.strip()
-        
-        # Check for word limits
-        if "(1 word only)" in prompt:
-            words = response.split()
-            if len(words) > 1:
-                return words[0]
-        
-        elif "(1-2 words only)" in prompt:
-            words = response.split()
-            if len(words) > 2:
-                return " ".join(words[:2])
-        
-        elif "(1-3 words only)" in prompt:
-            words = response.split()
-            if len(words) > 3:
-                return " ".join(words[:3])
-        
-        elif "(2-4 words only)" in prompt:
-            words = response.split()
-            if len(words) < 2:
-                return response + " example"  # Add a generic word if too short
-            if len(words) > 4:
-                return " ".join(words[:4])
-        
-        # Check for character limits
-        if "max 30 characters" in prompt and len(response) > 30:
-            return response[:30]
-        
-        if "max 50 characters" in prompt and len(response) > 50:
-            return response[:50]
-        
-        # Special handling for code snippets
-        if "def example():" in prompt:
-            lines = response.split("\n")
-            if len(lines) > 3:
-                return "\n".join(lines[:3])
-            if not response.startswith("def"):
-                return f"def example():\n{response}"
-        
-        return response
-
-    def _generate_variables_with_model(self, domain: str, variable_prompts: Dict[str, str]) -> Dict[str, str]:
-        """Generate variables using the gold standard model with validation."""
-        variables = {}
-        for var_name, prompt in variable_prompts.items():
-            response = self.client.chat.completions.create(
-                model=self.gold_standard_model,
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": f"You are an expert in {domain}. Generate only the requested output, no explanations. Follow the length/format constraints exactly."
-                    },
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            response_text = response.choices[0].message.content.strip()
-            variables[var_name] = self._validate_response(response_text, prompt)
-        return variables
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     def _get_default_variables(self, domain: str) -> Dict[str, str]:
         """Get default variables for a domain."""
@@ -161,10 +44,56 @@ class DatasetGenerator:
             return {}
         
         domain_vars = default_vars[domain]
-        return {
-            key: random.choice(value) if isinstance(value, list) else value
-            for key, value in domain_vars.items()
-        }
+        variables = {}
+        
+        for key, value in domain_vars.items():
+            if key == 'topic_pairs':
+                # Handle topic pairs
+                pair = random.choice(value)
+                variables['topic_1'] = pair[0]
+                variables['topic_2'] = pair[1]
+            elif key == 'concept_pairs':
+                # Handle concept pairs
+                pair = random.choice(value)
+                variables['concept_1'] = pair[0]
+                variables['concept_2'] = pair[1]
+            else:
+                variables[key] = random.choice(value) if isinstance(value, list) else value
+        
+        return variables
+
+    def _generate_variables_with_model(self, domain: str, variable_prompts: Dict[str, str]) -> Dict[str, str]:
+        """Generate variables using the gold standard model."""
+        variables = {}
+        for var_name, prompt in variable_prompts.items():
+            response = self.client.chat.completions.create(
+                model=self.gold_standard_model,
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": f"You are an expert in {domain}. Generate only the requested output, no explanations. Follow the length/format constraints exactly."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=50,
+                temperature=0.7
+            )
+            if var_name == 'topic_pairs':
+                # Handle topic pairs
+                pair = response.choices[0].message.content.strip().split(",")
+                variables['topic_1'] = pair[0]
+                variables['topic_2'] = pair[1]
+            elif var_name == 'concept_pairs':
+                # Handle concept pairs
+                pair = response.choices[0].message.content.strip().split(",")
+                variables['concept_1'] = pair[0]
+                variables['concept_2'] = pair[1]
+            else:
+                variables[var_name] = response.choices[0].message.content.strip()
+        
+
+
+        return variables
 
     def _generate_prompt(self, domain: str) -> tuple:
         """Generate a prompt for the specified domain."""

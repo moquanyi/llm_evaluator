@@ -147,8 +147,6 @@ prompt_templates:
       equation_type: "Name a single type of equation (1 word only)"
       equation: "Write a single mathematical equation (max 30 characters)"
       problem: "Write a single mathematical problem statement (max 50 characters)"
-      concept_1: "Name a single mathematical concept (1-2 words only)"
-      concept_2: "Name a single mathematical concept (1-2 words only)"
 
 default_variables:
   general:
