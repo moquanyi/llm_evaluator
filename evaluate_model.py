@@ -278,21 +278,46 @@ Repeat for each criterion, then provide a JSON object at the end with all scores
                     current_criterion = line[1:-1].strip()
                 elif line.startswith("Score:") and current_criterion:
                     try:
-                        scores[current_criterion] = float(line.split(":")[-1].strip())
-                    except ValueError:
+                        score_str = line.split(":")[-1].strip()
+                        # Handle N/A scores
+                        if score_str.upper() == 'N/A':
+                            scores[current_criterion] = 0.0
+                            continue
+                            
+                        # Convert percentage to decimal if needed
+                        if "%" in score_str:
+                            score_str = score_str.replace("%", "")
+                            scores[current_criterion] = float(score_str) / 100
+                        else:
+                            # Convert any string numbers to float
+                            score_str = score_str.split("/")[0].strip() if "/" in score_str else score_str
+                            scores[current_criterion] = float(score_str)
+                    except (ValueError, TypeError) as e:
+                        print(f"Error parsing score for {current_criterion}: {line} - {e}")
                         scores[current_criterion] = 0.0
 
         # Ensure all criteria have scores
-        domain_criteria = self.dataset["evaluation_criteria"][domain]
+        domain_criteria = self.dataset.get("evaluation_criteria", {}).get(domain, {})
+        if not domain_criteria:
+            # If no criteria found, just return the scores as is
+            scores["overall_score"] = sum(float(v) for v in scores.values()) / len(scores) if scores else 0.0
+            return scores
+
+        # Add missing criteria with default scores
         for criterion in domain_criteria:
             if criterion not in scores:
                 scores[criterion] = 0.0
 
-        # Calculate overall score
-        weights = {k: v["weight"] for k, v in domain_criteria.items()}
-        weighted_sum = sum(scores[k] * weights[k] for k in domain_criteria)
-        total_weight = sum(weights.values())
-        scores["overall_score"] = weighted_sum / total_weight if total_weight > 0 else 0.0
+        # Calculate overall score using weights if available
+        try:
+            weights = {k: float(domain_criteria[k].get("weight", 1.0)) for k in domain_criteria}
+            weighted_sum = sum(float(scores[k]) * weights[k] for k in domain_criteria)
+            total_weight = sum(weights.values())
+            scores["overall_score"] = weighted_sum / total_weight if total_weight > 0 else 0.0
+        except (KeyError, TypeError, AttributeError) as e:
+            # If there's any error with weights, use simple average
+            print(f"Error calculating weighted score: {e}")
+            scores["overall_score"] = sum(float(scores[k]) for k in domain_criteria) / len(domain_criteria)
 
         return scores
 
